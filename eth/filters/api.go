@@ -42,6 +42,9 @@ type filter struct {
 	crit     FilterCriteria
 	logs     []*types.Log
 	s        *Subscription // associated subscription in event system
+
+	//AMH handle full pending tx instead of just hash
+	pending []*pendingTx
 }
 
 // PublicFilterAPI offers support to create and manage filters. This will allow external clients to retrieve various
@@ -108,12 +111,13 @@ func (api *PublicFilterAPI) timeoutLoop(timeout time.Duration) {
 // https://eth.wiki/json-rpc/API#eth_newpendingtransactionfilter
 func (api *PublicFilterAPI) NewPendingTransactionFilter() rpc.ID {
 	var (
-		pendingTxs   = make(chan []common.Hash)
+		pendingTxs   = make(chan []*pendingTx)
 		pendingTxSub = api.events.SubscribePendingTxs(pendingTxs)
 	)
 
+	f := &filter{typ: PendingTransactionsSubscription, deadline: time.NewTimer(api.timeout), hashes: make([]common.Hash, 0), s: pendingTxSub}
 	api.filtersMu.Lock()
-	api.filters[pendingTxSub.ID] = &filter{typ: PendingTransactionsSubscription, deadline: time.NewTimer(api.timeout), hashes: make([]common.Hash, 0), s: pendingTxSub}
+	api.filters[pendingTxSub.ID] = f
 	api.filtersMu.Unlock()
 
 	go func() {
@@ -121,9 +125,11 @@ func (api *PublicFilterAPI) NewPendingTransactionFilter() rpc.ID {
 			select {
 			case ph := <-pendingTxs:
 				api.filtersMu.Lock()
-				if f, found := api.filters[pendingTxSub.ID]; found {
-					f.hashes = append(f.hashes, ph...)
-				}
+				f.pending = append(f.pending, ph...)
+
+				// if f, found := api.filters[pendingTxSub.ID]; found {
+				// 	f.hashes = append(f.hashes, ph...)
+				// }
 				api.filtersMu.Unlock()
 			case <-pendingTxSub.Err():
 				api.filtersMu.Lock()
@@ -148,17 +154,18 @@ func (api *PublicFilterAPI) NewPendingTransactions(ctx context.Context) (*rpc.Su
 	rpcSub := notifier.CreateSubscription()
 
 	go func() {
-		txHashes := make(chan []common.Hash, 128)
-		pendingTxSub := api.events.SubscribePendingTxs(txHashes)
+		txPending := make(chan []*pendingTx, 128)
+		pendingTxSub := api.events.SubscribePendingTxs(txPending)
 
 		for {
 			select {
-			case hashes := <-txHashes:
-				// To keep the original behaviour, send a single tx hash in one notification.
-				// TODO(rjl493456442) Send a batch of tx hashes in one notification
-				for _, h := range hashes {
-					notifier.Notify(rpcSub.ID, h)
-				}
+			case pending := <-txPending:
+				notifier.Notify(rpcSub.ID, pending)
+				// // To keep the original behaviour, send a single tx hash in one notification.
+				// // TODO(rjl493456442) Send a batch of tx hashes in one notification
+				// for _, h := range hashes {
+				// 	notifier.Notify(rpcSub.ID, h)
+				// }
 			case <-rpcSub.Err():
 				pendingTxSub.Unsubscribe()
 				return

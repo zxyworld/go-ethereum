@@ -78,6 +78,9 @@ type subscription struct {
 	headers   chan *types.Header
 	installed chan struct{} // closed when the filter is installed
 	err       chan error    // closed when the filter is uninstalled
+
+	//AMH: pending tx channel for my custom pending tx type
+	pending chan []*pendingTx
 }
 
 // EventSystem creates subscriptions, processes events and broadcasts them to the
@@ -292,16 +295,17 @@ func (es *EventSystem) SubscribeNewHeads(headers chan *types.Header) *Subscripti
 
 // SubscribePendingTxs creates a subscription that writes transaction hashes for
 // transactions that enter the transaction pool.
-func (es *EventSystem) SubscribePendingTxs(hashes chan []common.Hash) *Subscription {
+func (es *EventSystem) SubscribePendingTxs(pendingTxs chan []*pendingTx) *Subscription {
 	sub := &subscription{
-		id:        rpc.NewID(),
-		typ:       PendingTransactionsSubscription,
-		created:   time.Now(),
-		logs:      make(chan []*types.Log),
-		hashes:    hashes,
+		id:      rpc.NewID(),
+		typ:     PendingTransactionsSubscription,
+		created: time.Now(),
+		logs:    make(chan []*types.Log),
+		// hashes:    hashes,
 		headers:   make(chan *types.Header),
 		installed: make(chan struct{}),
 		err:       make(chan error),
+		pending:   pendingTxs,
 	}
 	return es.subscribe(sub)
 }
@@ -342,12 +346,13 @@ func (es *EventSystem) handleRemovedLogs(filters filterIndex, ev core.RemovedLog
 }
 
 func (es *EventSystem) handleTxsEvent(filters filterIndex, ev core.NewTxsEvent) {
-	hashes := make([]common.Hash, 0, len(ev.Txs))
+	pending := make([]*pendingTx, 0, len(ev.Txs))
 	for _, tx := range ev.Txs {
-		hashes = append(hashes, tx.Hash())
+		ptx := makePendingTx(tx)
+		pending = append(pending, ptx)
 	}
 	for _, f := range filters[PendingTransactionsSubscription] {
-		f.hashes <- hashes
+		f.pending <- pending
 	}
 }
 
