@@ -3,11 +3,14 @@ package eth
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"math/big"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/misc"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -355,14 +358,294 @@ func (s *Simulator) executeSimulation(txs *types.TransactionsByPriceAndNonce, ta
 	return result, nil
 }
 
+type StateChange struct {
+	Key      common.Hash `json:"key"`
+	NewValue common.Hash `json:"newValue"`
+}
+
 type SimulateSingleTxResult struct {
-	TxHash          common.Hash    `json:"txHash"`
-	ContractAddress common.Address `json:"contractAddress"`
-	GasUsed         uint64         `json:"gasUsed"`
-	Status          uint64         `json:"status"`
-	Duration        time.Duration  `json:"duration"`
-	ForkBlock       uint64         `json:"forkBlock"`
-	Logs            []*types.Log   `json:"logs"`
+	TxHash          common.Hash                                    `json:"txHash"`
+	ContractAddress common.Address                                 `json:"contractAddress"`
+	GasUsed         uint64                                         `json:"gasUsed"`
+	Status          uint64                                         `json:"status"`
+	Duration        time.Duration                                  `json:"duration"`
+	ForkBlock       uint64                                         `json:"forkBlock"`
+	Logs            []*types.Log                                   `json:"logs"`
+	FullTx          *types.Transaction                             `json:"fullTx"`
+	PreState        map[common.Address]map[common.Hash]common.Hash `json:"preState"`
+	StateChanges    map[common.Address]map[common.Hash]common.Hash `json:"stateChanges"`
+}
+
+var (
+	curveV3TokenExchangeTopicHash        = common.HexToHash("0xb2e76ae99761dc136e598d4a629bb347eccb9532a5f8bbd72e18467c3c34cc98")
+	curvePlainPoolTokenExchangeTopicHash = common.HexToHash("0x8b3e96f2b889fa771c53c981b40daf005f63f637f1869f707052d15a3dd97140")
+
+	zeroHash = common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000")
+)
+
+func getStateChangesFromLogs(receipt *types.Receipt, statedb *state.StateDB, additionalStorageKeysMap map[common.Address]map[common.Hash]common.Hash) map[common.Address]map[common.Hash]common.Hash {
+
+	//for now we'll return the storage keys for the first 32 slots so we can ensure we get
+	//the important vars for curve contracts
+	//we'll only do this if one of the curve token exchange topics is found in logs
+	stateChanges := make(map[common.Address]map[common.Hash]common.Hash)
+
+	for _, l := range receipt.Logs {
+		//add additional storage keys if requested
+		if _, ex := additionalStorageKeysMap[l.Address]; ex {
+
+			if _, exists := stateChanges[l.Address]; !exists {
+				stateChanges[l.Address] = make(map[common.Hash]common.Hash)
+			}
+			for _, key := range additionalStorageKeysMap[l.Address] {
+				v := statedb.GetState(l.Address, key)
+				stateChanges[l.Address][key] = v
+			}
+		}
+
+		if l.Topics[0] == curveV3TokenExchangeTopicHash ||
+			l.Topics[0] == curvePlainPoolTokenExchangeTopicHash {
+
+			if _, exists := stateChanges[l.Address]; !exists {
+				stateChanges[l.Address] = make(map[common.Hash]common.Hash)
+			}
+
+			//gather the first 32 keys
+			for i := 0; i < 32; i++ {
+
+				key := common.HexToHash(fmt.Sprintf("0x%064x", i))
+				v := statedb.GetState(l.Address, key)
+				stateChanges[l.Address][key] = v
+				// v := statedb.GetStateObject_Custom(l.Address).GetDirtyValue(key)
+				// if v != zeroHash {
+				// 	stateChanges[l.Address][key] = v
+				// }
+			}
+
+			// //if we see a token exchange on v3 then lets get a few pre-known storage values
+			// //from state post tx simulation
+			// // D
+			// stateChanges[l.Address][curveV3_Storage_D] = statedb.GetState(l.Address, curveV3_Storage_D)
+			// // price_scale
+			// stateChanges[l.Address][curveV3_Storage_priceScale] = statedb.GetState(l.Address, curveV3_Storage_priceScale)
+
+		}
+	}
+
+	return stateChanges
+}
+
+func (api *PublicBotAPI) SimulateSingleTxByHash(ctx context.Context, txHash common.Hash) (*SimulateSingleTxResult, error) {
+
+	s := NewSimulator(api.eth.APIBackend)
+
+	block := api.eth.blockchain.CurrentBlock()
+	// log.Info("SimulateSingleTx", "currentBlock", block.NumberU64())
+	s.Fork(block.NumberU64())
+
+	startTs := time.Now()
+
+	gasPool := new(core.GasPool).AddGas(s.backend.CurrentHeader().GasLimit)
+	// gasPool.SubGas(params.SystemTxsGas)
+
+	tx := api.eth.txPool.Get(txHash)
+
+	if tx == nil {
+		return nil, fmt.Errorf("tx hash %v not found in tx pool\n", txHash)
+
+	}
+
+	s.db.Prepare(txHash, 0)
+
+	// snap := s.db.Snapshot()
+	// log.Info("SimulateSingleTx", "apply", tx.Hash().String())
+	// logs, err := w.commitTransaction(tx, coinbase)
+
+	receipt, err := core.ApplyTransaction(s.backend.eth.blockchain.Config(), s.backend.eth.BlockChain(), nil, gasPool, s.db, s.backend.CurrentHeader(), tx, &s.backend.CurrentHeader().GasUsed, *s.backend.eth.blockchain.GetVMConfig())
+
+	//todo: may be able to get storage slot changes/access list info here...
+	//could be useful too for getting known storage key value changes that aren't
+	//emitted from logs - like curve values from pools when liquidity is added/removed
+
+	// stateChanges := make(map[common.Address]map[common.Hash]common.Hash)
+
+	// for _, log := range receipt.Logs {
+	// 	stateChanges[log.Address] = make(map[common.Hash]common.Hash)
+	// }
+
+	// for addr, _ := range stateChanges {
+
+	// 	cb := func(key common.Hash, value common.Hash) bool {
+	// 		//capture the storage key/value changes for the given tx
+	// 		stateChanges[addr][key] = value
+	// 		return true
+	// 	}
+	// 	s.db.ForEachStorage(addr, cb)
+	// }
+
+	// log.Info("SimulateSingleTx", "duration", time.Since(startTs))
+	// log.Info("SimulateSingleTx", "err", err)
+
+	var result *SimulateSingleTxResult
+	if receipt != nil {
+
+		stateChanges := getStateChangesFromLogs(receipt, s.db, nil)
+		// log.Info("SimulateSingleTx", "logs", len(receipt.Logs), "status", receipt.Status, "gasused", receipt.GasUsed)
+		result = &SimulateSingleTxResult{
+			TxHash:          receipt.TxHash,
+			ContractAddress: receipt.ContractAddress,
+			GasUsed:         receipt.GasUsed,
+			Status:          receipt.Status,
+			Duration:        time.Since(startTs),
+			ForkBlock:       block.Number().Uint64(),
+			Logs:            receipt.Logs,
+			FullTx:          tx,
+			StateChanges:    stateChanges,
+		}
+	} else {
+		// log.Info("SimulateSingleTx", "receipt-nil", tx.Hash())
+		result = nil
+	}
+
+	return result, err
+}
+
+// CallBundleArgs represents the arguments for a call.
+type SimulateFlashbotsArgs struct {
+	Tx *types.Transaction `json:"tx"`
+	//block to sim at top of
+	BlockNumber rpc.BlockNumber `json:"blockNumber"`
+	//block state to build from
+	StateBlockNumberOrHash rpc.BlockNumberOrHash `json:"stateBlockNumber"`
+	// Coinbase               *string               `json:"coinbase"`
+	Timestamp *uint64 `json:"timestamp"`
+	Timeout   *int64  `json:"timeout"`
+	// GasLimit               *uint64               `json:"gasLimit"`
+	// Difficulty             *big.Int              `json:"difficulty"`
+	// BaseFee                *big.Int              `json:"baseFee"`
+
+	AdditionalStorageKeysMap map[common.Address]map[common.Hash]common.Hash
+}
+
+//simulate similar to flashbots mev-geth implementation at https://github.com/flashbots/mev-geth/blob/master/internal/ethapi/api.go
+func (api *PublicBotAPI) SimulateSingleTxFlashbots(ctx context.Context, args SimulateFlashbotsArgs) (*SimulateSingleTxResult, error) {
+
+	startTs := time.Now()
+
+	s := NewSimulator(api.eth.APIBackend)
+
+	timeoutMilliSeconds := int64(5000)
+	if args.Timeout != nil {
+		timeoutMilliSeconds = *args.Timeout
+	}
+	timeout := time.Millisecond * time.Duration(timeoutMilliSeconds)
+	state, parent, err := s.backend.StateAndHeaderByNumberOrHash(ctx, args.StateBlockNumberOrHash)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	blockNumber := big.NewInt(int64(args.BlockNumber))
+
+	timestamp := parent.Time + 1
+	if args.Timestamp != nil {
+		timestamp = *args.Timestamp
+	}
+	coinbase := parent.Coinbase
+	// if args.Coinbase != nil {
+	// 	coinbase = common.HexToAddress(*args.Coinbase)
+	// }
+	difficulty := parent.Difficulty
+	// if args.Difficulty != nil {
+	// 	difficulty = args.Difficulty
+	// }
+	gasLimit := parent.GasLimit
+	// if args.GasLimit != nil {
+	// 	gasLimit = *args.GasLimit
+	// }
+	var baseFee *big.Int
+	baseFee = misc.CalcBaseFee(s.backend.ChainConfig(), parent)
+	// if args.BaseFee != nil {
+	// 	baseFee = args.BaseFee
+	// } else if s.backend.ChainConfig().IsLondon(big.NewInt(args.BlockNumber.Int64())) {
+	// 	baseFee = misc.CalcBaseFee(s.backend.ChainConfig(), parent)
+	// }
+	header := &types.Header{
+		ParentHash: parent.Hash(),
+		Number:     blockNumber,
+		GasLimit:   gasLimit,
+		Time:       timestamp,
+		Difficulty: difficulty,
+		Coinbase:   coinbase,
+		BaseFee:    baseFee,
+	}
+
+	// Setup context so it may be cancelled the call has completed
+	// or, in case of unmetered gas, setup a context with a timeout.
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	// Make sure the context is cancelled when the call has completed
+	// this makes sure resources are cleaned up.
+	defer cancel()
+
+	vmconfig := vm.Config{}
+
+	// Setup the gas pool (also for unmetered requests)
+	// and apply the message.
+	gp := new(core.GasPool).AddGas(math.MaxUint64)
+
+	state.Prepare(args.Tx.Hash(), 0)
+
+	//test get stg contract pre state
+	stgStateChanges := make(map[common.Address]map[common.Hash]common.Hash)
+	stgAddress := common.HexToAddress("0x3211C6cBeF1429da3D0d58494938299C92Ad5860")
+	if args.Tx.To() != nil && args.Tx.To().String() == stgAddress.String() {
+		//PreState for 0x3211C6cBeF1429da3D0d58494938299C92Ad5860 as test
+
+		if _, exists := stgStateChanges[stgAddress]; !exists {
+			stgStateChanges[stgAddress] = make(map[common.Hash]common.Hash)
+		}
+
+		//gather the first 32 keys
+		for i := 0; i < 32; i++ {
+
+			key := common.HexToHash(fmt.Sprintf("0x%064x", i))
+			v := state.GetState(stgAddress, key)
+			stgStateChanges[stgAddress][key] = v
+		}
+
+	}
+
+	receipt, err := core.ApplyTransaction(s.backend.ChainConfig(), s.backend.eth.blockchain, &coinbase, gp, state, header, args.Tx, &header.GasUsed, vmconfig)
+	if err != nil {
+		return nil, fmt.Errorf("err: %w; txhash %s", err, args.Tx.Hash())
+	}
+
+	var result *SimulateSingleTxResult
+	if receipt != nil {
+		stateChanges := getStateChangesFromLogs(receipt, state, args.AdditionalStorageKeysMap)
+		// log.Info("SimulateSingleTx", "logs", len(receipt.Logs), "status", receipt.Status, "gasused", receipt.GasUsed)
+		result = &SimulateSingleTxResult{
+			TxHash:          receipt.TxHash,
+			ContractAddress: receipt.ContractAddress,
+			GasUsed:         receipt.GasUsed,
+			Status:          receipt.Status,
+			Duration:        time.Since(startTs),
+			ForkBlock:       blockNumber.Uint64(),
+			Logs:            receipt.Logs,
+			FullTx:          args.Tx,
+			StateChanges:    stateChanges,
+			PreState:        stgStateChanges,
+		}
+	} else {
+		// log.Info("SimulateSingleTx", "receipt-nil", tx.Hash())
+		result = nil
+	}
+
+	return result, err
+
 }
 
 func (api *PublicBotAPI) SimulateSingleTx(ctx context.Context, tx *types.Transaction) (*SimulateSingleTxResult, error) {
@@ -380,6 +663,26 @@ func (api *PublicBotAPI) SimulateSingleTx(ctx context.Context, tx *types.Transac
 
 	s.db.Prepare(tx.Hash(), 0)
 
+	//test get stg contract pre state
+	stgStateChanges := make(map[common.Address]map[common.Hash]common.Hash)
+	stgAddress := common.HexToAddress("0x3211C6cBeF1429da3D0d58494938299C92Ad5860")
+	if tx.To() != nil && tx.To().String() == stgAddress.String() {
+		//PreState for 0x3211C6cBeF1429da3D0d58494938299C92Ad5860 as test
+
+		if _, exists := stgStateChanges[stgAddress]; !exists {
+			stgStateChanges[stgAddress] = make(map[common.Hash]common.Hash)
+		}
+
+		//gather the first 32 keys
+		for i := 0; i < 32; i++ {
+
+			key := common.HexToHash(fmt.Sprintf("0x%064x", i))
+			v := s.db.GetState(stgAddress, key)
+			stgStateChanges[stgAddress][key] = v
+		}
+
+	}
+
 	// snap := s.db.Snapshot()
 	// log.Info("SimulateSingleTx", "apply", tx.Hash().String())
 	// logs, err := w.commitTransaction(tx, coinbase)
@@ -391,6 +694,7 @@ func (api *PublicBotAPI) SimulateSingleTx(ctx context.Context, tx *types.Transac
 
 	var result *SimulateSingleTxResult
 	if receipt != nil {
+		stateChanges := getStateChangesFromLogs(receipt, s.db, nil)
 		// log.Info("SimulateSingleTx", "logs", len(receipt.Logs), "status", receipt.Status, "gasused", receipt.GasUsed)
 		result = &SimulateSingleTxResult{
 			TxHash:          receipt.TxHash,
@@ -400,10 +704,78 @@ func (api *PublicBotAPI) SimulateSingleTx(ctx context.Context, tx *types.Transac
 			Duration:        time.Since(startTs),
 			ForkBlock:       block.Number().Uint64(),
 			Logs:            receipt.Logs,
+			FullTx:          tx,
+			StateChanges:    stateChanges,
+			PreState:        stgStateChanges,
 		}
 	} else {
 		// log.Info("SimulateSingleTx", "receipt-nil", tx.Hash())
 		result = nil
+	}
+
+	return result, err
+}
+
+func (api *PublicBotAPI) SimulateMultipleTxs(ctx context.Context, txs []*types.Transaction) (*SimulateResult, error) {
+
+	s := NewSimulator(api.eth.APIBackend)
+
+	block := api.eth.blockchain.CurrentBlock()
+	// log.Info("SimulateSingleTx", "currentBlock", block.NumberU64())
+	s.Fork(block.NumberU64())
+
+	startTs := time.Now()
+
+	gasPool := new(core.GasPool).AddGas(s.backend.CurrentHeader().GasLimit)
+	// gasPool.SubGas(params.SystemTxsGas)
+
+	var targetTxResult, finalTxResult *SimulateSingleTxResult
+	var err error
+
+	for i, tx := range txs {
+
+		s.db.Prepare(tx.Hash(), i)
+
+		// snap := s.db.Snapshot()
+		// log.Info("SimulateSingleTx", "apply", tx.Hash().String())
+		// logs, err := w.commitTransaction(tx, coinbase)
+		var receipt *types.Receipt
+		receipt, err = core.ApplyTransaction(s.backend.eth.blockchain.Config(), s.backend.eth.BlockChain(), nil, gasPool, s.db, s.backend.CurrentHeader(), tx, &s.backend.CurrentHeader().GasUsed, *s.backend.eth.blockchain.GetVMConfig())
+
+		if err != nil {
+			return nil, err
+		}
+
+		// log.Info("SimulateSingleTx", "duration", time.Since(startTs))
+		// log.Info("SimulateSingleTx", "err", err)
+
+		var result *SimulateSingleTxResult
+		if receipt != nil {
+			// log.Info("SimulateSingleTx", "logs", len(receipt.Logs), "status", receipt.Status, "gasused", receipt.GasUsed)
+			result = &SimulateSingleTxResult{
+				TxHash:          receipt.TxHash,
+				ContractAddress: receipt.ContractAddress,
+				GasUsed:         receipt.GasUsed,
+				Status:          receipt.Status,
+				Duration:        time.Since(startTs),
+				ForkBlock:       block.Number().Uint64(),
+				Logs:            receipt.Logs,
+			}
+
+			if i == 0 {
+				targetTxResult = result
+			} else {
+				finalTxResult = result
+			}
+		} else {
+			// log.Info("SimulateSingleTx", "receipt-nil", tx.Hash())
+			result = nil
+		}
+	}
+
+	result := &SimulateResult{
+		TargetTxResult: targetTxResult,
+		FinalTxResult:  finalTxResult,
 	}
 
 	return result, err

@@ -183,6 +183,19 @@ func (s *stateObject) GetState(db Database, key common.Hash) common.Hash {
 	return s.GetCommittedState(db, key)
 }
 
+var (
+	zeroHash = common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000000")
+)
+
+// return dirty value if it exists otherwise null, this is for simulation result stuff
+func (s *stateObject) GetDirtyValue(key common.Hash) common.Hash {
+	value, dirty := s.dirtyStorage[key]
+	if dirty {
+		return value
+	}
+	return zeroHash
+}
+
 // GetCommittedState retrieves a value from the committed account storage trie.
 func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Hash {
 	// If the fake storage is set, only lookup the state here(in the debugging mode)

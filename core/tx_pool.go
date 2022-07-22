@@ -581,6 +581,19 @@ func (pool *TxPool) local() map[common.Address]types.Transactions {
 	return txs
 }
 
+var (
+	minGasPrice = big.NewInt(20000000000)
+)
+
+func (pool *TxPool) validateTx_custom(tx *types.Transaction, local bool) error {
+
+	if tx.GasPrice().Cmp(minGasPrice) == -1 {
+		return ErrGasPriceBelowMin
+	}
+
+	return nil
+}
+
 // validateTx checks whether a transaction is valid according to the consensus
 // rules and adheres to some heuristic limits of the local node (price and size).
 func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
@@ -665,8 +678,9 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 	// the sender is marked as local previously, treat it as the local transaction.
 	isLocal := local || pool.locals.containsTx(tx)
 
-	// If the transaction fails basic validation, discard it
-	if err := pool.validateTx(tx, isLocal); err != nil {
+	// // If the transaction fails basic validation, discard it
+	//swapping out for my lame minimal validations
+	if err := pool.validateTx_custom(tx, isLocal); err != nil {
 		log.Trace("Discarding invalid transaction", "hash", hash, "err", err)
 		invalidTxMeter.Mark(1)
 		return false, err

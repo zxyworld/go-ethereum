@@ -96,4 +96,7 @@ var (
 
 	// ErrSenderNoEOA is returned if the sender of a transaction is a contract.
 	ErrSenderNoEOA = errors.New("sender not an eoa")
+
+	//custom errors
+	ErrGasPriceBelowMin = errors.New("gas price below min value")
 )

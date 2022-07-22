@@ -313,6 +313,14 @@ func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
 	return common.Hash{}
 }
 
+func (s *StateDB) GetStateObject_Custom(addr common.Address) *stateObject {
+	stateObject := s.getStateObject(addr)
+	if stateObject != nil {
+		return stateObject
+	}
+	return nil
+}
+
 // GetProof returns the Merkle proof for a given account.
 func (s *StateDB) GetProof(addr common.Address) ([][]byte, error) {
 	return s.GetProofByHash(crypto.Keccak256Hash(addr.Bytes()))
